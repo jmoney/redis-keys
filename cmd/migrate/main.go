@@ -128,6 +128,8 @@ func main() {
 		getDBSize(ctx, dest, "DEST", sugar)
 	case "migrate":
 		sugar.Infof("Starting migration with %d workers, batch size %d, sleep %dms", *workers, *batchSize, *sleepMs)
+		getDBSize(ctx, source, "SOURCE", sugar)
+		getDBSize(ctx, dest, "DEST", sugar)
 		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar)
 		getDBSize(ctx, source, "SOURCE", sugar)
 		getDBSize(ctx, dest, "DEST", sugar)
