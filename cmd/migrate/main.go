@@ -195,7 +195,7 @@ SCAN:
 					if i == 2 {
 						logger.Fatalf("SCAN ultimately failed after %d attempts: %v", i+1, err)
 					}
-					logger.Warnf("Retrying %d SCAN error: %v", i, err)
+					logger.Warnf("Retrying (%d/3) SCAN error: %v", (i + 1), err)
 					time.Sleep(1 * time.Second)
 					continue
 				} else {
