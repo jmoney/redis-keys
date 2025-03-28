@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -31,7 +32,12 @@ func getDBSize(ctx context.Context, client *redis.Client) (int64, error) {
 }
 
 // Copies a single key from source to dest
-func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger *zap.SugaredLogger) {
+func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger *zap.SugaredLogger, filter *bloom.BloomFilter) {
+	if filter != nil && filter.TestString(key) {
+		logger.Debugf("Skipping already copied key: %s", key)
+		return
+	}
+
 	val, err := source.Dump(ctx, key).Result()
 	if err != nil {
 		logger.Warnf("DUMP failed for key %s: %v", key, err)
@@ -48,6 +54,9 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 		logger.Warnf("RESTORE failed for key %s: %v", key, err)
 	} else {
 		logger.Debugf("Copied key: %s", key)
+		if filter != nil {
+			filter.AddString(key)
+		}
 	}
 }
 
@@ -76,7 +85,7 @@ func startKeyCountLogger(ctx context.Context, dest *redis.Client, logger *zap.Su
 }
 
 // Performs migration from source to dest with concurrency
-func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, workers, sleepMs int, logger *zap.SugaredLogger) {
+func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, workers, sleepMs int, logger *zap.SugaredLogger, filter *bloom.BloomFilter) {
 	var cursor uint64
 	var wg sync.WaitGroup
 	keyChan := make(chan string, batchSize*workers)
@@ -94,7 +103,7 @@ func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, wor
 					if !ok {
 						return
 					}
-					copyKey(ctx, source, dest, key, logger)
+					copyKey(ctx, source, dest, key, logger, filter)
 					if sleepMs > 0 {
 						time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 					}
@@ -150,6 +159,9 @@ func main() {
 	workers := flag.Int("workers", 10, "Number of concurrent workers for migration")
 	batchSize := flag.Int("batch", 100, "SCAN batch size")
 	sleepMs := flag.Int("sleep", 0, "Delay (ms) between copying keys (per worker)")
+	resumeBloomFile := flag.String("resume-bloom-file", "resume.bloom", "Path to Bloom filter file for resume support")
+	estKeys := flag.Uint("bloom-estimate", 1000000, "Estimated number of keys for Bloom filter")
+	fpRate := flag.Float64("bloom-fpr", 0.0001, "False positive rate for Bloom filter")
 	flag.Parse()
 
 	if *sourceAddr == "" || *destAddr == "" {
@@ -171,6 +183,36 @@ func main() {
 	source := newRedisClient(*sourceAddr)
 	dest := newRedisClient(*destAddr)
 
+	// Load or initialize Bloom filter
+	var bloomFilter *bloom.BloomFilter
+	if *mode == "migrate" {
+		if file, err := os.Open(*resumeBloomFile); err == nil {
+			defer file.Close()
+			bloomFilter = bloom.New(*estKeys, 5)
+			_, err := bloomFilter.ReadFrom(file)
+			if err != nil {
+				sugar.Fatalf("Failed to load Bloom filter: %v", err)
+			}
+			sugar.Infof("Loaded Bloom filter from %s", *resumeBloomFile)
+		} else {
+			bloomFilter = bloom.NewWithEstimates(*estKeys, *fpRate)
+			sugar.Infof("Initialized new Bloom filter with capacity %d", *estKeys)
+		}
+		defer func() {
+			file, err := os.Create(*resumeBloomFile)
+			if err != nil {
+				sugar.Errorf("Failed to save Bloom filter: %v", err)
+				return
+			}
+			defer file.Close()
+			if _, err := bloomFilter.WriteTo(file); err != nil {
+				sugar.Errorf("Failed to write Bloom filter: %v", err)
+			} else {
+				sugar.Infof("Saved Bloom filter to %s", *resumeBloomFile)
+			}
+		}()
+	}
+
 	switch *mode {
 	case "count":
 		if size, err := getDBSize(ctx, source); err != nil {
@@ -188,7 +230,7 @@ func main() {
 	case "migrate":
 		sugar.Infof("Starting migration with %d workers, batch size %d, sleep %dms", *workers, *batchSize, *sleepMs)
 		cancelCountLogger := startKeyCountLogger(ctx, dest, sugar)
-		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar)
+		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar, bloomFilter)
 		cancelCountLogger()
 
 	default:
