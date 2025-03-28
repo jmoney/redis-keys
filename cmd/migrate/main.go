@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"flag"
@@ -31,8 +32,18 @@ func getDBSize(ctx context.Context, client *redis.Client) (int64, error) {
 	return client.DBSize(ctx).Result()
 }
 
-// Copies a single key from source to dest
-func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger *zap.SugaredLogger, filter *bloom.BloomFilter) {
+// Logs a failed key to a file with thread-safe write
+func logFailedKey(file *os.File, mu *sync.Mutex, key string) {
+	if file == nil {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	file.WriteString(key + "\n")
+}
+
+// Copies a single key from source to dest with retry logic and optional error logging
+func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger *zap.SugaredLogger, filter *bloom.BloomFilter, errLogFile *os.File, errLogMu *sync.Mutex) {
 	if filter != nil && filter.TestString(key) {
 		logger.Debugf("Skipping already copied key: %s", key)
 		return
@@ -45,6 +56,7 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 	var ttl time.Duration
 	var err error
 
+	// Retry DUMP
 	for i := 0; i < maxRetries; i++ {
 		val, err = source.Dump(ctx, key).Result()
 		if err == nil {
@@ -55,9 +67,11 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 	}
 	if err != nil {
 		logger.Errorf("DUMP ultimately failed for key %s after %d attempts", key, maxRetries)
+		logFailedKey(errLogFile, errLogMu, key)
 		return
 	}
 
+	// Retry PTTL
 	for i := 0; i < maxRetries; i++ {
 		ttl, err = source.PTTL(ctx, key).Result()
 		if err == nil {
@@ -67,10 +81,12 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 		time.Sleep(retryDelay)
 	}
 	if err != nil {
-		logger.Warnf("Using default TTL (0) for key %s after %d failed attempts", key, maxRetries)
-		ttl = 0
+		logger.Errorf("PTTL ultimately failed for key %s after %d attempts. Skipping key.", key, maxRetries)
+		logFailedKey(errLogFile, errLogMu, key)
+		return
 	}
 
+	// Retry RESTORE
 	for i := 0; i < maxRetries; i++ {
 		err = dest.RestoreReplace(ctx, key, ttl, val).Err()
 		if err == nil {
@@ -81,6 +97,7 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 	}
 	if err != nil {
 		logger.Errorf("RESTORE ultimately failed for key %s after %d attempts", key, maxRetries)
+		logFailedKey(errLogFile, errLogMu, key)
 		return
 	}
 
@@ -88,6 +105,28 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 	if filter != nil {
 		filter.AddString(key)
 	}
+}
+
+// Reprocesses a list of keys from file
+func reprocessKeys(ctx context.Context, source, dest *redis.Client, path string, logger *zap.SugaredLogger, errLogFile *os.File) {
+	file, err := os.Open(path)
+	if err != nil {
+		logger.Fatalf("Failed to open retry input file: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	var mu sync.Mutex
+	for scanner.Scan() {
+		key := scanner.Text()
+		if key != "" {
+			copyKey(ctx, source, dest, key, logger, nil, errLogFile, &mu)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Errorf("Error reading retry file: %v", err)
+	}
+	logger.Info("Reprocessing complete!")
 }
 
 // Kicks off a goroutine to log destination DB size every 2 seconds
@@ -114,13 +153,12 @@ func startKeyCountLogger(ctx context.Context, dest *redis.Client, logger *zap.Su
 	return cancel
 }
 
-// Performs migration from source to dest with concurrency
-func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, workers, sleepMs int, logger *zap.SugaredLogger, filter *bloom.BloomFilter) {
+func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, workers, sleepMs int, logger *zap.SugaredLogger, filter *bloom.BloomFilter, errLogFile *os.File) {
 	var cursor uint64
 	var wg sync.WaitGroup
+	var errLogMu sync.Mutex
 	keyChan := make(chan string, batchSize*workers)
 
-	// Worker pool
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -133,7 +171,7 @@ func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, wor
 					if !ok {
 						return
 					}
-					copyKey(ctx, source, dest, key, logger, filter)
+					copyKey(ctx, source, dest, key, logger, filter, errLogFile, &errLogMu)
 					if sleepMs > 0 {
 						time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 					}
@@ -142,16 +180,27 @@ func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, wor
 		}(i)
 	}
 
-	// SCAN loop to feed keys
 SCAN:
 	for {
 		select {
 		case <-ctx.Done():
 			break SCAN
 		default:
-			keys, nextCursor, err := source.Scan(ctx, cursor, "*", int64(batchSize)).Result()
-			if err != nil {
-				logger.Fatalf("SCAN error: %v", err)
+			var keys []string
+			var nextCursor uint64
+			var err error
+			for i := 0; i < 3; i++ {
+				keys, nextCursor, err = source.Scan(ctx, cursor, "*", int64(batchSize)).Result()
+				if err != nil {
+					if i == 2 {
+						logger.Fatalf("SCAN ultimately failed after %d attempts: %v", i+1, err)
+					}
+					logger.Warnf("Retrying %d SCAN error: %v", i, err)
+					time.Sleep(1 * time.Second)
+					continue
+				} else {
+					break
+				}
 			}
 
 			for _, key := range keys {
@@ -161,44 +210,42 @@ SCAN:
 				case keyChan <- key:
 				}
 			}
-
 			cursor = nextCursor
 			if cursor == 0 {
 				break
 			}
 		}
 	}
-
 	close(keyChan)
 	wg.Wait()
 	logger.Info("Migration complete!")
 }
 
 func main() {
-	// Setup colorized logger
 	cfg := zap.NewDevelopmentConfig()
 	cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	logger, _ := cfg.Build()
 	defer logger.Sync()
 	sugar := logger.Sugar()
 
-	// CLI flags
 	sourceAddr := flag.String("source", "", "Source Redis address (host:port)")
 	destAddr := flag.String("dest", "", "Destination Redis address (host:port)")
-	mode := flag.String("mode", "count", "Mode: 'count' or 'migrate'")
+	mode := flag.String("mode", "count", "Mode: 'count', 'migrate', or 'reprocess'")
 	workers := flag.Int("workers", 10, "Number of concurrent workers for migration")
 	batchSize := flag.Int("batch", 100, "SCAN batch size")
 	sleepMs := flag.Int("sleep", 0, "Delay (ms) between copying keys (per worker)")
 	resumeBloomFile := flag.String("resume-bloom-file", "resume.bloom", "Path to Bloom filter file for resume support")
 	estKeys := flag.Uint("bloom-estimate", 1000000, "Estimated number of keys for Bloom filter")
 	fpRate := flag.Float64("bloom-fpr", 0.0001, "False positive rate for Bloom filter")
+	errorKeyLog := flag.String("error-key-log", "", "Path to file where failed keys will be logged")
+	retryInput := flag.String("retry-input", "", "Path to file with keys to retry")
+	retryOutput := flag.String("retry-output", "", "Path to file to log keys that still fail after retry")
 	flag.Parse()
 
 	if *sourceAddr == "" || *destAddr == "" {
 		sugar.Fatal("Both --source and --dest are required")
 	}
 
-	// Setup context with signal handling
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -213,7 +260,6 @@ func main() {
 	source := newRedisClient(*sourceAddr)
 	dest := newRedisClient(*destAddr)
 
-	// Load or initialize Bloom filter
 	var bloomFilter *bloom.BloomFilter
 	if *mode == "migrate" {
 		if file, err := os.Open(*resumeBloomFile); err == nil {
@@ -243,6 +289,16 @@ func main() {
 		}()
 	}
 
+	var errLogFile *os.File
+	if *errorKeyLog != "" {
+		var err error
+		errLogFile, err = os.Create(*errorKeyLog)
+		if err != nil {
+			sugar.Fatalf("Failed to create error log file: %v", err)
+		}
+		defer errLogFile.Close()
+	}
+
 	switch *mode {
 	case "count":
 		if size, err := getDBSize(ctx, source); err != nil {
@@ -250,7 +306,6 @@ func main() {
 		} else {
 			sugar.Infof("[SOURCE] DB size: %d keys", size)
 		}
-
 		if size, err := getDBSize(ctx, dest); err != nil {
 			sugar.Errorf("Failed to get DEST DB size: %v", err)
 		} else {
@@ -260,10 +315,25 @@ func main() {
 	case "migrate":
 		sugar.Infof("Starting migration with %d workers, batch size %d, sleep %dms", *workers, *batchSize, *sleepMs)
 		cancelCountLogger := startKeyCountLogger(ctx, dest, sugar)
-		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar, bloomFilter)
+		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar, bloomFilter, errLogFile)
 		cancelCountLogger()
 
+	case "reprocess":
+		if *retryInput == "" {
+			sugar.Fatal("--retry-input is required in reprocess mode")
+		}
+		var retryLogFile *os.File
+		if *retryOutput != "" {
+			var err error
+			retryLogFile, err = os.Create(*retryOutput)
+			if err != nil {
+				sugar.Fatalf("Failed to create retry output file: %v", err)
+			}
+			defer retryLogFile.Close()
+		}
+		reprocessKeys(ctx, source, dest, *retryInput, sugar, retryLogFile)
+
 	default:
-		sugar.Fatalf("Unknown mode: %s (use 'count' or 'migrate')", *mode)
+		sugar.Fatalf("Unknown mode: %s (use 'count', 'migrate', or 'reprocess')", *mode)
 	}
 }
