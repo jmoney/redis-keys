@@ -38,25 +38,55 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 		return
 	}
 
-	val, err := source.Dump(ctx, key).Result()
+	const maxRetries = 3
+	const retryDelay = 300 * time.Millisecond
+
+	var val string
+	var ttl time.Duration
+	var err error
+
+	for i := 0; i < maxRetries; i++ {
+		val, err = source.Dump(ctx, key).Result()
+		if err == nil {
+			break
+		}
+		logger.Warnf("DUMP failed for key %s (attempt %d/%d): %v", key, i+1, maxRetries, err)
+		time.Sleep(retryDelay)
+	}
 	if err != nil {
-		logger.Warnf("DUMP failed for key %s: %v", key, err)
+		logger.Errorf("DUMP ultimately failed for key %s after %d attempts", key, maxRetries)
 		return
 	}
 
-	ttl, err := source.PTTL(ctx, key).Result()
-	if err != nil || ttl < 0 {
+	for i := 0; i < maxRetries; i++ {
+		ttl, err = source.PTTL(ctx, key).Result()
+		if err == nil {
+			break
+		}
+		logger.Warnf("PTTL failed for key %s (attempt %d/%d): %v", key, i+1, maxRetries, err)
+		time.Sleep(retryDelay)
+	}
+	if err != nil {
+		logger.Warnf("Using default TTL (0) for key %s after %d failed attempts", key, maxRetries)
 		ttl = 0
 	}
 
-	err = dest.RestoreReplace(ctx, key, ttl, val).Err()
-	if err != nil {
-		logger.Warnf("RESTORE failed for key %s: %v", key, err)
-	} else {
-		logger.Debugf("Copied key: %s", key)
-		if filter != nil {
-			filter.AddString(key)
+	for i := 0; i < maxRetries; i++ {
+		err = dest.RestoreReplace(ctx, key, ttl, val).Err()
+		if err == nil {
+			break
 		}
+		logger.Warnf("RESTORE failed for key %s (attempt %d/%d): %v", key, i+1, maxRetries, err)
+		time.Sleep(retryDelay)
+	}
+	if err != nil {
+		logger.Errorf("RESTORE ultimately failed for key %s after %d attempts", key, maxRetries)
+		return
+	}
+
+	logger.Debugf("Copied key: %s", key)
+	if filter != nil {
+		filter.AddString(key)
 	}
 }
 
