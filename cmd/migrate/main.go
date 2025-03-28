@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,24 +15,22 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// Create a Redis client with optional TLS
 func newRedisClient(addr string) *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr: addr,
 		TLSConfig: &tls.Config{
-			InsecureSkipVerify: true, // only for self-signed certs or testing
+			InsecureSkipVerify: true, // use only for testing/self-signed certs
 		},
 	})
 }
 
-func getDBSize(ctx context.Context, client *redis.Client, label string, logger *zap.SugaredLogger) {
-	size, err := client.DBSize(ctx).Result()
-	if err != nil {
-		logger.Errorf("[%s] Failed to get DB size: %v", label, err)
-		return
-	}
-	logger.Infof("[%s] DB size: %d keys", label, size)
+// Generic function to return DB size
+func getDBSize(ctx context.Context, client *redis.Client) (int64, error) {
+	return client.DBSize(ctx).Result()
 }
 
+// Copies a single key from source to dest
 func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger *zap.SugaredLogger) {
 	val, err := source.Dump(ctx, key).Result()
 	if err != nil {
@@ -50,47 +51,7 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 	}
 }
 
-func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, workers, sleepMs int, logger *zap.SugaredLogger) {
-	var cursor uint64
-	var wg sync.WaitGroup
-	keyChan := make(chan string, batchSize*workers)
-
-	// Worker pool
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for key := range keyChan {
-				copyKey(ctx, source, dest, key, logger)
-				if sleepMs > 0 {
-					time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-				}
-			}
-		}(i)
-	}
-
-	// Producer: scan and enqueue keys
-	for {
-		keys, nextCursor, err := source.Scan(ctx, cursor, "*", int64(batchSize)).Result()
-		if err != nil {
-			logger.Fatalf("Scan error: %v", err)
-		}
-
-		for _, key := range keys {
-			keyChan <- key
-		}
-
-		cursor = nextCursor
-		if cursor == 0 {
-			break
-		}
-	}
-
-	close(keyChan)
-	wg.Wait()
-	logger.Info("Migration complete!")
-}
-
+// Kicks off a goroutine to log destination DB size every 2 seconds
 func startKeyCountLogger(ctx context.Context, dest *redis.Client, logger *zap.SugaredLogger) context.CancelFunc {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -102,9 +63,8 @@ func startKeyCountLogger(ctx context.Context, dest *redis.Client, logger *zap.Su
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				size, err := dest.DBSize(context.Background()).Result()
-				if err != nil {
-					logger.Warnf("Failed to get dest DB size: %v", err)
+				if size, err := getDBSize(context.Background(), dest); err != nil {
+					logger.Warnf("Failed to get DEST DB size: %v", err)
 				} else {
 					logger.Infof("[DEST] Key count: %d", size)
 				}
@@ -115,50 +75,122 @@ func startKeyCountLogger(ctx context.Context, dest *redis.Client, logger *zap.Su
 	return cancel
 }
 
+// Performs migration from source to dest with concurrency
+func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, workers, sleepMs int, logger *zap.SugaredLogger) {
+	var cursor uint64
+	var wg sync.WaitGroup
+	keyChan := make(chan string, batchSize*workers)
+
+	// Worker pool
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case key, ok := <-keyChan:
+					if !ok {
+						return
+					}
+					copyKey(ctx, source, dest, key, logger)
+					if sleepMs > 0 {
+						time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+					}
+				}
+			}
+		}(i)
+	}
+
+	// SCAN loop to feed keys
+SCAN:
+	for {
+		select {
+		case <-ctx.Done():
+			break SCAN
+		default:
+			keys, nextCursor, err := source.Scan(ctx, cursor, "*", int64(batchSize)).Result()
+			if err != nil {
+				logger.Fatalf("SCAN error: %v", err)
+			}
+
+			for _, key := range keys {
+				select {
+				case <-ctx.Done():
+					break SCAN
+				case keyChan <- key:
+				}
+			}
+
+			cursor = nextCursor
+			if cursor == 0 {
+				break
+			}
+		}
+	}
+
+	close(keyChan)
+	wg.Wait()
+	logger.Info("Migration complete!")
+}
+
 func main() {
-	// Init logger
-	logger, _ := zap.NewDevelopment()
-	defer logger.Sync()
+	// Setup colorized logger
 	cfg := zap.NewDevelopmentConfig()
 	cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
-
-	logger, err := cfg.Build()
-	if err != nil {
-		panic(err)
-	}
+	logger, _ := cfg.Build()
+	defer logger.Sync()
 	sugar := logger.Sugar()
 
-	// Flags
+	// CLI flags
 	sourceAddr := flag.String("source", "", "Source Redis address (host:port)")
 	destAddr := flag.String("dest", "", "Destination Redis address (host:port)")
 	mode := flag.String("mode", "count", "Mode: 'count' or 'migrate'")
 	workers := flag.Int("workers", 10, "Number of concurrent workers for migration")
 	batchSize := flag.Int("batch", 100, "SCAN batch size")
 	sleepMs := flag.Int("sleep", 0, "Delay (ms) between copying keys (per worker)")
-
 	flag.Parse()
 
 	if *sourceAddr == "" || *destAddr == "" {
 		sugar.Fatal("Both --source and --dest are required")
 	}
 
-	ctx := context.Background()
+	// Setup context with signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		sugar.Warn("Shutdown signal received, cleaning up...")
+		cancel()
+	}()
+
 	source := newRedisClient(*sourceAddr)
 	dest := newRedisClient(*destAddr)
 
 	switch *mode {
 	case "count":
-		getDBSize(ctx, source, "SOURCE", sugar)
-		getDBSize(ctx, dest, "DEST", sugar)
+		if size, err := getDBSize(ctx, source); err != nil {
+			sugar.Errorf("Failed to get SOURCE DB size: %v", err)
+		} else {
+			sugar.Infof("[SOURCE] DB size: %d keys", size)
+		}
+
+		if size, err := getDBSize(ctx, dest); err != nil {
+			sugar.Errorf("Failed to get DEST DB size: %v", err)
+		} else {
+			sugar.Infof("[DEST] DB size: %d keys", size)
+		}
+
 	case "migrate":
 		sugar.Infof("Starting migration with %d workers, batch size %d, sleep %dms", *workers, *batchSize, *sleepMs)
-		getDBSize(ctx, source, "SOURCE", sugar)
-		getDBSize(ctx, dest, "DEST", sugar)
 		cancelCountLogger := startKeyCountLogger(ctx, dest, sugar)
 		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar)
 		cancelCountLogger()
-		getDBSize(ctx, source, "SOURCE", sugar)
-		getDBSize(ctx, dest, "DEST", sugar)
+
 	default:
 		sugar.Fatalf("Unknown mode: %s (use 'count' or 'migrate')", *mode)
 	}
