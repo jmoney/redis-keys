@@ -189,7 +189,7 @@ SCAN:
 			var keys []string
 			var nextCursor uint64
 			var err error
-			for i := 0; i < 3; i++ {
+			for i := range 3 {
 				keys, nextCursor, err = source.Scan(ctx, cursor, "*", int64(batchSize)).Result()
 				if err != nil {
 					if i == 2 {
