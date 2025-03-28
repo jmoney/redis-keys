@@ -46,7 +46,7 @@ func copyKey(ctx context.Context, source, dest *redis.Client, key string, logger
 	if err != nil {
 		logger.Warnf("RESTORE failed for key %s: %v", key, err)
 	} else {
-		logger.Infof("Copied key: %s", key)
+		logger.Debugf("Copied key: %s", key)
 	}
 }
 
@@ -91,6 +91,30 @@ func migrateKeys(ctx context.Context, source, dest *redis.Client, batchSize, wor
 	logger.Info("Migration complete!")
 }
 
+func startKeyCountLogger(ctx context.Context, dest *redis.Client, logger *zap.SugaredLogger) context.CancelFunc {
+	ctx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				size, err := dest.DBSize(context.Background()).Result()
+				if err != nil {
+					logger.Warnf("Failed to get dest DB size: %v", err)
+				} else {
+					logger.Infof("[DEST] Key count: %d", size)
+				}
+			}
+		}
+	}()
+
+	return cancel
+}
+
 func main() {
 	// Init logger
 	logger, _ := zap.NewDevelopment()
@@ -130,7 +154,9 @@ func main() {
 		sugar.Infof("Starting migration with %d workers, batch size %d, sleep %dms", *workers, *batchSize, *sleepMs)
 		getDBSize(ctx, source, "SOURCE", sugar)
 		getDBSize(ctx, dest, "DEST", sugar)
+		cancelCountLogger := startKeyCountLogger(ctx, dest, sugar)
 		migrateKeys(ctx, source, dest, *batchSize, *workers, *sleepMs, sugar)
+		cancelCountLogger()
 		getDBSize(ctx, source, "SOURCE", sugar)
 		getDBSize(ctx, dest, "DEST", sugar)
 	default:
